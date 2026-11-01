@@ -1,26 +1,100 @@
 #!/usr/bin/bash
 
-# function for removing lockfile
-exit-ugreen-diskiomon() {
-  if [[ -f "/var/run/ugreen-diskiomon.lock" ]]; then
-    rm "/var/run/ugreen-diskiomon.lock"
-  fi
-  [[ -n "$smart_check_pid" ]] && kill $smart_check_pid 2>/dev/null
-  [[ -n "$zpool_check_pid" ]] && kill $zpool_check_pid 2>/dev/null
-  [[ -n "$disk_online_check_pid" ]] && kill $disk_online_check_pid 2>/dev/null
-  [[ -n "$standby_checker_pid" ]] && kill $standby_checker_pid 2>/dev/null
-  exit 0
+# Put a fresh per-process token in the initial environment, which remains
+# readable via /proc even after the PID file becomes stale.
+if [[ ${1:-} != --ugreen-internal ]]; then
+    read -r UGREEN_DISKIOMON_INSTANCE < /proc/sys/kernel/random/uuid
+    export UGREEN_DISKIOMON_INSTANCE
+    exec /usr/bin/bash "$0" --ugreen-internal "$@"
+fi
+shift
+
+# Stop each monitoring job and its subprocesses before starting another set.
+stop-monitors() {
+    local pid deadline
+    local -a pids=()
+
+    for pid in "${smart_check_pid:-}" "${zpool_check_pid:-}" \
+               "${disk_online_check_pid:-}" "${standby_checker_pid:-}" \
+               "${blink_monitor_pid:-}"; do
+        [[ -n "$pid" ]] && pids+=("$pid")
+    done
+
+    # Do not signal a numeric process group: its ID may have been reused.
+    # The helper validates the instance token and signals individual pidfds.
+    if (( ${#pids[@]} )) && ! ( exec {lock_fd}>&-; timeout -k 1s 5s /usr/bin/ugreen-diskiomon-notify --terminate "${pids[@]}" ); then
+        echo 'Could not safely stop disk monitor processes.' >&2
+        cleanup_failed=1
+    fi
+    deadline=$((SECONDS + 5))
+    for pid in "${pids[@]}"; do
+        # A shell job can exit before its own external commands. Do not
+        # start a replacement while any process in that job remains.
+        while kill -0 -- "-$pid" 2>/dev/null; do
+            if (( SECONDS >= deadline )); then
+                echo "Timed out waiting for disk monitor process group $pid." >&2
+                cleanup_failed=1
+                break
+            fi
+            ( exec {lock_fd}>&-; exec sleep 0.05 )
+        done
+        if ! kill -0 -- "-$pid" 2>/dev/null; then
+            # A child may have left its original group. Never block in wait
+            # on a still-running process, even if its old group disappeared.
+            if kill -0 "$pid" 2>/dev/null; then
+                echo "Disk monitor process $pid remains after its group disappeared." >&2
+                cleanup_failed=1
+            else
+                wait "$pid" 2>/dev/null || true
+            fi
+        fi
+    done
+
+    smart_check_pid= zpool_check_pid= disk_online_check_pid=
+    standby_checker_pid= blink_monitor_pid=
+    if (( cleanup_failed )); then
+        # Refuse subsequent starts until an administrator has checked the
+        # remaining processes; never start duplicate LED monitors.
+        : > /run/ugreen-diskiomon.cleanup-failed
+        return 1
+    fi
 }
 
-# check if script is already running
-if [[ -f "/var/run/ugreen-diskiomon.lock" ]]; then
+exit-ugreen-diskiomon() {
+    trap - EXIT INT TERM
+    trap '' USR1
+    rm -f /run/ugreen-diskiomon.pid
+    (( cleanup_failed )) || stop-monitors || true
+}
+
+# Keep the lock inode in place: unlinking a locked file permits a second lock.
+exec {lock_fd}>/run/ugreen-diskiomon.lock
+if ! flock -n "$lock_fd"; then
   echo "ugreen-diskiomon already running!"
   exit 1
 fi
-touch /var/run/ugreen-diskiomon.lock
+if [[ -e /run/ugreen-diskiomon.cleanup-failed ]]; then
+    echo 'Previous monitor cleanup failed; inspect remaining processes before removing /run/ugreen-diskiomon.cleanup-failed.' >&2
+    exit 1
+fi
 
-# trap exit and remove lockfile
-trap 'exit-ugreen-diskiomon' EXIT INT TERM
+# Each background job gets its own process group, including its children.
+set -m
+refresh_requested=0
+cleanup_failed=0
+trap 'exit-ugreen-diskiomon' EXIT
+trap 'exit 130' INT
+trap 'exit 0' TERM
+trap 'refresh_requested=1; [[ -z ${blink_monitor_pid:-} ]] || ( exec {lock_fd}>&-; timeout -k 1s 5s /usr/bin/ugreen-diskiomon-notify --terminate "$blink_monitor_pid" ) || true' USR1
+
+# A per-instance token and start time reject stale references. The helper uses
+# a pidfd so PID reuse cannot race with signal delivery.
+stat=$(< /proc/$$/stat)
+stat=${stat##*) }
+read -ra stat_fields <<< "$stat"
+start_time=${stat_fields[19]}
+rm -f /run/ugreen-diskiomon.pid
+( umask 077; printf '%s %s %s\n' "$$" "$start_time" "$UGREEN_DISKIOMON_INSTANCE" > /run/ugreen-diskiomon.pid )
 
 # use variables from config file (unRAID specific)
 if [[ -f /boot/config/plugins/ugreenleds-driver/settings.cfg ]]; then
@@ -36,37 +110,37 @@ fi
 MAPPING_METHOD=${MAPPING_METHOD:=ata} # ata, hctl, serial
 led_map=(disk1 disk2 disk3 disk4 disk5 disk6 disk7 disk8)
 
-# hctl, $> lsblk -S -x hctl -o hctl,serial,name 
-# NOTE: It is reported that the order below should be adjusted for each model. 
+# hctl, $> lsblk -S -x hctl -o hctl,serial,name
+# NOTE: It is reported that the order below should be adjusted for each model.
 #       Please check the disk mapping section in https://github.com/miskcoo/ugreen_dx4600_leds_controller/blob/master/README.md.
 hctl_map=("0:0:0:0" "1:0:0:0" "2:0:0:0" "3:0:0:0" "4:0:0:0" "5:0:0:0" "6:0:0:0" "7:0:0:0")
-# serial number, $> lsblk -S -x hctl -o hctl,serial,name 
+# serial number, $> lsblk -S -x hctl -o hctl,serial,name
 serial_map=(${DISK_SERIAL})
 # ata number, $> ls /sys/block | egrep ata\d
 ata_map=("ata1" "ata2" "ata3" "ata4" "ata5" "ata6" "ata7" "ata8")
 
-if which dmidecode > /dev/null; then
-    product_name=$(dmidecode --string system-product-name)
-    case "${product_name}" in 
+if ( exec {lock_fd}>&-; which dmidecode > /dev/null ); then
+    product_name=$(exec {lock_fd}>&-; dmidecode --string system-product-name)
+    case "${product_name}" in
         DXP6800*)   # tested on DXP6800 Pro
-            echo "Found UGREEN DXP6800 series" 
+            echo "Found UGREEN DXP6800 series"
             hctl_map=("2:0:0:0" "3:0:0:0" "4:0:0:0" "5:0:0:0" "0:0:0:0" "1:0:0:0")
             ata_map=("ata3" "ata4" "ata5" "ata6" "ata1" "ata2")
             ;;
         DX4600*)   # tested on DX4600 Pro
-            echo "Found UGREEN DX4600 series" 
+            echo "Found UGREEN DX4600 series"
             ;;
-        DX4700*) 
-            echo "Found UGREEN DX4700 series" 
+        DX4700*)
+            echo "Found UGREEN DX4700 series"
             ;;
         DXP2800*)   # see issue #19
-            echo "Found UGREEN DXP2800 series" 
+            echo "Found UGREEN DXP2800 series"
             ;;
-        DXP4800*) 
-            echo "Found UGREEN DXP4800 series" 
+        DXP4800*)
+            echo "Found UGREEN DXP4800 series"
             ;;
         DXP8800*)  # tested on DXP8800 Plus
-            echo "Found UGREEN DXP8800 series" 
+            echo "Found UGREEN DXP8800 series"
             # using the default mapping
             ;;
         *)
@@ -81,7 +155,7 @@ if which dmidecode > /dev/null; then
     esac
 elif [[ "${MAPPING_METHOD}" == "hctl" || "${MAPPING_METHOD}" == "ata" ]]; then
     echo -e "\033[0;31minstalling the tool `dmidecode` is suggested; otherwise the script cannot detect your device and adjust the hctl/ata_map\033[0m"
-fi 
+fi
 declare -A devices
 
 # set monitor SMART information to true by default if not running unRAID
@@ -111,7 +185,7 @@ COLOR_SMART_FAIL=${COLOR_SMART_FAIL:="255 0 0"}
 BRIGHTNESS_DISK_LEDS=${BRIGHTNESS_DISK_LEDS:="255"}
 
 
-{ lsmod | grep ledtrig_oneshot > /dev/null; } || { modprobe -v ledtrig_oneshot && sleep 2; }
+( exec {lock_fd}>&-; lsmod | grep ledtrig_oneshot > /dev/null ) || ( exec {lock_fd}>&-; modprobe -v ledtrig_oneshot && sleep 2 )
 
 function is_disk_healthy_or_standby() {
     if [[ "$1" == "$2" || "$1" == "$COLOR_DISK_STANDBY" ]]; then
@@ -151,8 +225,12 @@ function color_disk_health() {
     echo $COLOR
 }
 
+initialize-monitors() {
+devices=()
+dev_map=()
+dev_to_led_map=()
+zpool_ledmap=()
 echo Enumerating disks based on $MAPPING_METHOD...
-declare -A dev_map
 while read line
 do
     blk_line=($line)
@@ -161,21 +239,12 @@ do
     [[ -z "$key" ]] && continue
     dev_map[${key}]=${val}
     echo $MAPPING_METHOD ${key} ">>" ${dev_map[${key}]}
-done <<< "$(disk_enumerating_string)"
+done <<< "$(exec {lock_fd}>&-; disk_enumerating_string)"
 
 # initialize LEDs
-declare -A dev_to_led_map
 for i in "${!led_map[@]}"; do
     led=${led_map[i]}
     if [[ -d /sys/class/leds/$led ]]; then
-        echo oneshot > /sys/class/leds/$led/trigger
-        echo ${LED_INVERT:=1} > /sys/class/leds/$led/invert
-        echo 100 > /sys/class/leds/$led/delay_on
-        echo 100 > /sys/class/leds/$led/delay_off
-        color_health=$(color_disk_health "$led")
-        echo "$color_health" > /sys/class/leds/$led/color
-        echo "$BRIGHTNESS_DISK_LEDS" > /sys/class/leds/$led/brightness
-
         # find corresponding device
         _tmp_str=${MAPPING_METHOD}_map[@]
         _tmp_arr=(${!_tmp_str})
@@ -184,6 +253,13 @@ for i in "${!led_map[@]}"; do
             dev=${dev_map[${_tmp_arr[i]}]}
 
             if [[ -f /sys/class/block/${dev}/stat ]]; then
+                echo oneshot > /sys/class/leds/$led/trigger
+                echo ${LED_INVERT:=1} > /sys/class/leds/$led/invert
+                echo 100 > /sys/class/leds/$led/delay_on
+                echo 100 > /sys/class/leds/$led/delay_off
+                color_health=$(color_disk_health "$led")
+                echo "$color_health" > /sys/class/leds/$led/color
+                echo "$BRIGHTNESS_DISK_LEDS" > /sys/class/leds/$led/brightness
                 devices[$led]=${dev}
                 dev_to_led_map[$dev]=$led
             else
@@ -201,12 +277,11 @@ done
 
 # early exit if all bays are empty
 if [[ ${#devices[@]} -eq 0 ]]; then
-    echo "No ATA disk devices found in bays, disk LED monitoring disabled."
-    exit 0
+    echo "No ATA disk devices found in bays, waiting for hotplug."
+    return
 fi
 
 # construct zpool device mapping
-declare -A zpool_ledmap
 if [ "$CHECK_ZPOOL" = true ]; then
     echo Enumerating zpool devices...
     while read line
@@ -222,7 +297,7 @@ if [ "$CHECK_ZPOOL" = true ]; then
                 ;;
             dm*)
                 # find the underlying block device of the encrypted device
-                dm_slaves=($(ls /sys/block/${zpool_dev_name}/slaves))
+                dm_slaves=($(exec {lock_fd}>&-; ls /sys/block/${zpool_dev_name}/slaves))
                 zpool_scsi_dev_name=${dm_slaves[0]}
                 ;;
             *)
@@ -236,7 +311,7 @@ if [ "$CHECK_ZPOOL" = true ]; then
             zpool_ledmap[$zpool_dev_name]=${dev_to_led_map[${zpool_scsi_dev_name}]}
             echo "zpool device" $zpool_dev_name ">>" $zpool_scsi_dev_name ">> LED:"${zpool_ledmap[$zpool_dev_name]}
         fi
-    done <<< "$(zpool status -L | egrep ^\\s*\(sd\|dm\))"
+    done <<< "$(exec {lock_fd}>&-; zpool status -L | egrep ^\\s*\(sd\|dm\))"
 
     function zpool_check_loop() {
         while true; do
@@ -278,13 +353,14 @@ if [ "$CHECK_ZPOOL" = true ]; then
         done
     }
 
-    zpool_check_loop &
+    ( exec {lock_fd}>&-; zpool_check_loop ) &
     zpool_check_pid=$!
 fi
 
 # check disk health if enabled
 if [ "$CHECK_SMART" = true ]; then
 (
+    exec {lock_fd}>&-
     while true; do
         for led in "${!devices[@]}"; do
 
@@ -316,6 +392,7 @@ fi
 
 # check disk online status
 (
+    exec {lock_fd}>&-
     while true; do
         for led in "${!devices[@]}"; do
             dev=${devices[$led]}
@@ -361,7 +438,7 @@ diskiomon_parameters() {
 STANDBY_MON_PATH=${STANDBY_MON_PATH:=/usr/bin/ugreen-check-standby}
 STANDBY_CHECK_INTERVAL=${STANDBY_CHECK_INTERVAL:=1}
 if [ -f "${STANDBY_MON_PATH}" ]; then
-    ${STANDBY_MON_PATH} ${STANDBY_CHECK_INTERVAL} "${COLOR_DISK_STANDBY}" "$(disk_health_parameters)" $(diskiomon_parameters) &
+    ( exec {lock_fd}>&-; exec ${STANDBY_MON_PATH} ${STANDBY_CHECK_INTERVAL} "${COLOR_DISK_STANDBY}" "$(disk_health_parameters)" $(diskiomon_parameters) ) &
     standby_checker_pid=$!
 fi
 
@@ -369,9 +446,12 @@ fi
 BLINK_MON_PATH=${BLINK_MON_PATH:=/usr/bin/ugreen-blink-disk}
 if [ -f "${BLINK_MON_PATH}" ]; then
 
-    ${BLINK_MON_PATH} ${LED_REFRESH_INTERVAL} $(diskiomon_parameters)
+    ( exec {lock_fd}>&-; exec ${BLINK_MON_PATH} ${LED_REFRESH_INTERVAL} $(diskiomon_parameters) ) &
+    blink_monitor_pid=$!
 
 else
+    (
+    exec {lock_fd}>&-
     declare -A diskio_data_rw
     while true; do
         for led in "${!devices[@]}"; do
@@ -389,4 +469,33 @@ else
         sleep ${LED_REFRESH_INTERVAL}s
 
     done
+    ) &
+    blink_monitor_pid=$!
 fi
+
+}
+
+declare -A dev_map dev_to_led_map zpool_ledmap
+while true; do
+    refresh_requested=0
+    initialize-monitors
+    # A signal received during initialization must trigger another pass.
+    while (( ! refresh_requested )); do
+        if [[ -n ${blink_monitor_pid:-} ]]; then
+            if (( ! refresh_requested )); then
+                wait "$blink_monitor_pid"
+                blink_status=$?
+                if (( ! refresh_requested )); then
+                    echo "Disk activity monitor exited unexpectedly (status $blink_status)." >&2
+                    (( blink_status != 0 )) || blink_status=1
+                    exit "$blink_status"
+                fi
+            fi
+        else
+            ( exec {lock_fd}>&-; exec sleep infinity ) &
+            blink_monitor_pid=$!
+            (( refresh_requested )) || wait "$blink_monitor_pid" || true
+        fi
+    done
+    stop-monitors || exit 1
+done

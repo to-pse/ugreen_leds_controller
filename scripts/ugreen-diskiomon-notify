@@ -1,0 +1,65 @@
+#!/usr/bin/python3
+"""Notify a running disk monitor without signalling a reused PID."""
+
+import os
+import signal
+import sys
+
+def terminate_jobs(groups):
+    """Signal only processes belonging to this monitor instance via pidfds."""
+    token = ('UGREEN_DISKIOMON_INSTANCE=' + os.environ['UGREEN_DISKIOMON_INSTANCE']).encode('ascii')
+    failed = False
+    for entry in os.scandir('/proc'):
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            with open(f'/proc/{pid}/stat', encoding='ascii') as stat:
+                fields = stat.read().rsplit(')', 1)[1].split()
+            if fields[0] == 'Z' or int(fields[2]) not in groups:
+                continue
+            fd = os.pidfd_open(pid)
+            try:
+                # Recheck group and identity after acquiring the pidfd.
+                with open(f'/proc/{pid}/stat', encoding='ascii') as stat:
+                    current = stat.read().rsplit(')', 1)[1].split()
+                with open(f'/proc/{pid}/environ', 'rb') as environ:
+                    variables = environ.read().split(b'\0')
+                with open(f'/proc/self/fdinfo/{fd}', encoding='ascii') as info:
+                    pidfd_info = info.read().splitlines()
+                if (current[19] == fields[19] and int(current[2]) in groups
+                        and token in variables and f'Pid:\t{pid}' in pidfd_info):
+                    signal.pidfd_send_signal(fd, signal.SIGTERM)
+            finally:
+                os.close(fd)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except (OSError, ValueError, IndexError) as error:
+            print(f'ugreen-diskiomon-notify: cannot stop {pid}: {error}', file=sys.stderr)
+            failed = True
+    return 1 if failed else 0
+
+if len(sys.argv) > 1 and sys.argv[1] == '--terminate':
+    sys.exit(terminate_jobs({int(arg) for arg in sys.argv[2:]}))
+
+try:
+    with open('/run/ugreen-diskiomon.pid', encoding='ascii') as reference:
+        pid_text, expected_start, token = reference.read().split()
+    pid = int(pid_text)
+    if pid <= 1:
+        raise ValueError('invalid PID')
+    fd = os.pidfd_open(pid)
+    try:
+        with open(f'/proc/{pid}/stat', encoding='ascii') as stat:
+            start = stat.read().rsplit(')', 1)[1].split()[19]
+        with open(f'/proc/{pid}/environ', 'rb') as environ:
+            variables = environ.read().split(b'\0')
+        expected_token = b'UGREEN_DISKIOMON_INSTANCE=' + token.encode('ascii')
+        if start == expected_start and expected_token in variables:
+            signal.pidfd_send_signal(fd, signal.SIGUSR1)
+    finally:
+        os.close(fd)
+except (FileNotFoundError, ProcessLookupError, ValueError, IndexError):
+    pass
+except OSError as error:
+    print(f'ugreen-diskiomon-notify: {error}', file=sys.stderr)

@@ -34,7 +34,7 @@ For the process of understanding this control logic, please refer to [my blog (i
 > Please follow the [Preparation](#Preparation) section to check if the protocol is compatible, and run `./ugreen_leds_cli all` to see which LEDs are supported by this tool.
 
 For third-party systems, I am using Debian 12 "Bookworm", but you can find some manuals for other systems:
-- **Debian**: see [the section below](#start-at-boot-for-debian-12)
+- **Debian**: see [the section below](#start-at-boot-for-debian-12-and-13)
 - **DSM**: see [#8](https://github.com/miskcoo/ugreen_leds_controller/issues/8)
 - **Proxmox**: you need to use the CLI tool in Proxmox, not in a VM
 - **TrueNAS**:
@@ -72,7 +72,7 @@ $ apt install -y i2c-tools
 $ modprobe -v i2c-dev
 ```
 
-Now, we can check if the device located at address `0x3a` of *SMBus I801 adapter* is visible.
+List the I2C adapters and identify the *SMBus I801 adapter*. The adapter number is system-dependent: on a tested DXP4800 Pro it was `i2c-0`, while the example below uses `i2c-1`. Avoid blindly scanning or registering a device on an assumed bus. The probe script below checks the controller at `0x3a` and registers it only if necessary.
 
 ```
 $ i2cdetect -l
@@ -80,16 +80,6 @@ i2c-0   i2c             Synopsys DesignWare I2C adapter         I2C adapter
 i2c-1   smbus           SMBus I801 adapter at efa0              SMBus adapter
 i2c-2   i2c             Synopsys DesignWare I2C adapter         I2C adapter
 
-$ i2cdetect -y 1
-     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
-00:                         08 -- -- -- -- -- -- --
-10: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
-20: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
-30: 30 -- -- -- -- 35 UU UU -- -- 3a -- -- -- -- --
-40: -- -- -- -- 44 -- -- -- -- -- -- -- -- -- -- --
-50: UU -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
-60: -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
-70: -- -- -- -- -- -- -- --
 ```
 
 ## Build & Usage
@@ -138,21 +128,41 @@ ugreen_leds_cli power -on -color 0 0 255 -brightness 128 -status
 
 ### The Kernel Module
 
+For a numbered Debian 13 installation of the kernel module, LED initialization, and disk monitor, see [Debian 13 installation](debian13-installation.md). The documented DXP4800 Pro hardware and reboot results are in [the B5 test report](b5-reboot-test.md).
+
+On Debian 13, install build tools, DKMS, I2C tools, and headers matching the running kernel before building the module:
+
+```bash
+apt install build-essential dkms i2c-tools "linux-headers-$(uname -r)"
+```
+
+Run installation commands as root. Use the matching headers for your kernel; custom kernels may require headers from their vendor.
+
 There are three methods to install the module:
 
 - **A)** Run `cd kmod && make` to build the kernel module, and then load it with `sudo insmod led-ugreen.ko`.
 
-- **B)** Alternatively, you can install it with dkms:
+- **B)** Alternatively, you can install it with DKMS. For a fresh manual installation from the repository root:
 
   ```bash
-  cp -r kmod /usr/src/led-ugreen-0.1
-  dkms add -m led-ugreen -v 0.1
-  dkms build -m led-ugreen -v 0.1 && dkms install -m led-ugreen -v 0.1
+  cp -r kmod /usr/src/led-ugreen-0.3
+  dkms add -m led-ugreen -v 0.3
+  dkms build -m led-ugreen -v 0.3
+  dkms install -m led-ugreen -v 0.3
   ```
 
 - **C)** You can also directly install the `.deb` package [here](https://github.com/miskcoo/ugreen_leds_controller/releases).
 
-After loading the `led-ugreen` module, you need to run `scripts/ugreen-probe-leds`, and you can see LEDs in `/sys/class/leds`.
+For a DKMS installation, check `dkms status led-ugreen` and `modinfo -k "$(uname -r)" led-ugreen`. DKMS is configured to rebuild the module for kernel updates, but the new kernel's matching headers and a successful build are required; verify DKMS status again after an update. With Secure Boot enabled, the module must be signed by a trusted key; enrolling a DKMS signing key may be necessary before it can load.
+
+Loading the module alone does not register the LED controller. Run `scripts/ugreen-probe-leds` as root to locate the I801 adapter, register the controller at `0x3a` if needed, and verify its binding and disk LEDs. The adapter number printed by the script can be used for a read-only check, for example (replace `0` with the detected bus number):
+
+```bash
+readlink -f /sys/bus/i2c/devices/0-003a/driver
+ls -l /sys/class/leds/disk*
+```
+
+The driver link should end in `led-ugreen`. The number of disk LEDs depends on the model; the tested DXP4800 Pro has four. If the adapter is missing or ambiguous, the device belongs to another driver, or LEDs are missing, resolve the problem before starting monitoring. Do not manually re-register an existing device.
 
 Below is an example of setting color, brightness, and blink of the `power` LED:
 
@@ -178,7 +188,9 @@ echo 100 > /sys/class/leds/$led/interval
 To blink the `disk` LED when a block device is active, you can use the `ledtrig-oneshot` module and monitor the changes of`/sys/block/sda/stat` (see `scripts/ugreen-diskiomon` for an example). If you are using zfs, you can combine this script with that provided in [#1](https://github.com/miskcoo/ugreen_leds_controller/issues/1) to change the LED's color when a disk drive failure occurs.  
 To see how to map the disk LEDs to correct disk slots, please read the [Disk Mapping](#disk-mapping) section.
 
-#### Start at Boot (for Debian 12)
+#### Start at Boot (for Debian 12 and 13)
+
+For the complete Debian 13 disk-monitor-only sequence, including DKMS, I2C initialization and reboot checks, use [debian13-installation.md](debian13-installation.md). The following general example additionally configures network and power LED services.
 
 The configure file of `ugreen-diskiomon` and `ugreen-netdevmon` is `/etc/ugreen-leds.conf`.  
 Please see `scripts/ugreen-leds.conf` for an example.
@@ -193,13 +205,16 @@ Please see `scripts/ugreen-leds.conf` for an example.
   EOF
   ```
 
-- Install the `smartctl` tool: `apt install smartmontools`
+- Install the monitoring dependencies: `apt install smartmontools python3 util-linux`. The disk monitor requires Python 3.9 or newer, `flock`, `timeout`, and Linux pidfd support (Linux 5.3 or newer).
 
 - Install the kernel module by one of the three methods mentioned above.  
   For example, directly install [the deb package](https://github.com/miskcoo/ugreen_leds_controller/releases).
 
-- Copy files in the `scripts` directory: 
+- A `led-ugreen-utils` Debian package built from this checkout installs the disk monitor, helper, and udev rule. Previously released packages may not include the hotplug changes. If installing the utilities manually, run the following commands as root from the repository root and stop if any command fails:
   ```bash
+  # install the helper first; the disk monitor also uses it for cleanup
+  install -m 0755 scripts/ugreen-diskiomon-notify /usr/bin/ugreen-diskiomon-notify || exit 1
+
   # copy the scripts
   scripts=(ugreen-{detect-{disks,network},diskiomon,netdevmon{,-multi},power-led,probe-leds})
   for f in ${scripts[@]}; do
@@ -212,11 +227,20 @@ Please see `scripts/ugreen-leds.conf` for an example.
   
   # copy the systemd services
   cp scripts/systemd/*.service /etc/systemd/system/
+
+  # install and reload the SATA hotplug rule before starting the monitor
+  install -D -m 0644 scripts/99-ugreen-diskiomon.rules /usr/lib/udev/rules.d/99-ugreen-diskiomon.rules || exit 1
+  udevadm control --reload || exit 1
   
   systemctl daemon-reload
+
+  # initialize and verify the controller before starting LED monitors
+  systemctl start ugreen-probe-leds.service || exit 1
+  systemctl status ugreen-probe-leds.service --no-pager
   
   # change enp2s0 to the network device you want to monitor
   systemctl start ugreen-netdevmon@enp2s0
+  test -x /usr/bin/ugreen-diskiomon-notify || { echo "Disk monitor helper is missing" >&2; exit 1; }
   systemctl start ugreen-diskiomon
   systemctl start ugreen-power-led
   
@@ -226,6 +250,8 @@ Please see `scripts/ugreen-leds.conf` for an example.
   systemctl enable ugreen-diskiomon
   systemctl enable ugreen-power-led
   ```
+
+  `ugreen-diskiomon.service` requires and starts after `ugreen-probe-leds.service`. If `/run/ugreen-diskiomon.cleanup-failed` exists, its start condition prevents automatic restarts; inspect the journal and remaining monitor processes before resolving the failure. The marker is in `/run` and does not persist across a reboot.
 
 - (_Optional_) To reduce the CPU usage of blinking LEDs when disks are active, you can enter the `scripts` directory and do the following things:
   ```bash

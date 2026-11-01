@@ -33,17 +33,70 @@ if ! lsmod | grep -q led_ugreen; then
     fi
 fi
 
-i2c_dev=$(i2cdetect -l | grep "SMBus I801 adapter" | grep -Po "i2c-\d+")
-
-if [ $? = 0 ]; then 
-        echo "Found I2C device /dev/${i2c_dev}"
-        dev_path=/sys/bus/i2c/devices/$i2c_dev/${i2c_dev/i2c-/}-003a
-        if [ ! -d $dev_path ]; then
-            echo "led-ugreen 0x3a" > /sys/bus/i2c/devices/${i2c_dev}/new_device
-        elif [ "$(cat $dev_path/name)" != "led-ugreen" ]; then
-            echo "ERROR: the device ${i2c_dev/i2c-/}-003a has been registered as $(cat $dev_path/name)"
-            exit 1
-        fi
-else
-        echo "I2C device not found!"
+# The disk monitor uses the oneshot trigger for activity LEDs.
+if ! modprobe -v ledtrig_oneshot; then
+    echo "ERROR: failed to load ledtrig_oneshot" >&2
+    exit 1
 fi
+
+if ! i2c_list=$(i2cdetect -l); then
+    echo "ERROR: failed to list I2C adapters" >&2
+    exit 1
+fi
+
+adapters=()
+while IFS= read -r line; do
+    if [[ "$line" == *"SMBus I801 adapter"* && "$line" =~ ^(i2c-[0-9]+)[[:space:]] ]]; then
+        adapters+=("${BASH_REMATCH[1]}")
+    fi
+done <<< "$i2c_list"
+
+if (( ${#adapters[@]} != 1 )); then
+    echo "ERROR: expected one SMBus I801 adapter, found ${#adapters[@]}" >&2
+    exit 1
+fi
+
+i2c_dev=${adapters[0]}
+dev_path=/sys/bus/i2c/devices/$i2c_dev/${i2c_dev/i2c-/}-003a
+echo "Found I2C adapter $i2c_dev"
+
+if [[ ! -d "$dev_path" ]]; then
+    if ! echo "led-ugreen 0x3a" > "/sys/bus/i2c/devices/$i2c_dev/new_device"; then
+        echo "ERROR: failed to register led-ugreen on $i2c_dev at 0x3a" >&2
+        exit 1
+    fi
+fi
+
+if ! read -r device_name < "$dev_path/name" || [[ "$device_name" != led-ugreen ]]; then
+    echo "ERROR: $dev_path is not a registered led-ugreen device" >&2
+    exit 1
+fi
+
+# Probe may be deferred; never re-register or bind a device owned by another driver.
+driver_path=
+for ((attempt=0; attempt<10; attempt++)); do
+    if [[ -L "$dev_path/driver" ]]; then
+        driver_path=$(readlink -f "$dev_path/driver") || true
+        [[ -n "$driver_path" ]] && break
+    fi
+    sleep 0.2
+done
+if [[ "$driver_path" != /sys/bus/i2c/drivers/led-ugreen ]]; then
+    echo "ERROR: $dev_path is not bound to the led-ugreen driver" >&2
+    exit 1
+fi
+
+device_real=$(readlink -f "$dev_path")
+found_disk_led=false
+for led in /sys/class/leds/disk[1-8]; do
+    [[ -e "$led" ]] || continue
+    if [[ $(readlink -f "$led/device") == "$device_real" ]]; then
+        found_disk_led=true
+        break
+    fi
+done
+if [[ "$found_disk_led" != true ]]; then
+    echo "ERROR: no disk LEDs found for $dev_path" >&2
+    exit 1
+fi
+echo "UGREEN LED controller initialized on $i2c_dev"

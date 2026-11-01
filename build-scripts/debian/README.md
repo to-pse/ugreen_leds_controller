@@ -2,6 +2,8 @@
 
 Build Debian packages for UGREEN LED controller in Docker.
 
+This document covers **building packages**, not installing them on the NAS. For the manual Debian 13 installation, kernel headers, DKMS verification, I2C initialization, and service startup, see the [Debian 13 installation guide](../../debian13-installation.md). Package installation can configure and start systemd services; review the package scripts before installing on an active system.
+
 ## Quick Start
 
 Build all packages for Debian Bookworm (default):
@@ -31,19 +33,15 @@ DEBIAN_VERSION=trixie ./docker-run.sh
 ./docker-run.sh --skip-systemd
 ```
 
-**Build specific git ref:**
-```bash
-./docker-run.sh v0.3
-./docker-run.sh main
-```
+**Build a specific git ref:** `docker-run.sh` copies the current checkout and uses the local build mode. Select the desired ref in a separate clean checkout before running it; passing a ref argument does not switch the copied checkout in that mode.
 
 ## Output Files
 
 After building, you'll find these packages in `./build/`:
 - `led-ugreen-dkms_0.3-1_all.deb` (architecture-independent DKMS source package)
-- `led-ugreen-cli_0.3-1_amd64.deb`
-- `led-ugreen-utils_0.3-1_amd64.deb`
-- `led-ugreen-systemd_0.3-1_amd64.deb`
+- `led-ugreen-cli_0.3_amd64.deb`
+- `led-ugreen-utils_0.3_amd64.deb`
+- `led-ugreen-systemd_0.3_all.deb`
 
 ## Package Structure
 
@@ -51,7 +49,7 @@ Four packages are built:
 
 ### 1. led-ugreen-dkms
 Kernel module with DKMS support.
-- Auto-compiles on kernel updates
+- Configured to rebuild on kernel updates when matching headers and a working build environment are available
 - Creates module autoload configuration
 - **No dependencies** (except dkms)
 
@@ -90,7 +88,7 @@ This builds all packages and tests installation in a clean Debian container.
 
 The DKMS package (`led-ugreen-dkms`) is architecture-independent (`all`) as it contains only source code.
 
-The CLI, utils, and systemd packages are built for **amd64** (x86_64) architecture.
+The CLI and utils packages are built for **amd64** (x86_64); the systemd package is architecture-independent (`all`).
 
 The build system uses `--platform linux/amd64` to ensure correct architecture even when building on ARM-based Macs.
 

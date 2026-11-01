@@ -1,0 +1,3 @@
+# Whole SATA disks only. DEVPATH is retained on remove even if udev properties
+# such as ID_BUS have already disappeared.
+ACTION=="add|remove", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="sd*", DEVPATH=="*/ata[0-9]*/host*/target*/*/block/sd*", ENV{ID_BUS}!="usb", RUN+="/usr/bin/ugreen-diskiomon-notify"

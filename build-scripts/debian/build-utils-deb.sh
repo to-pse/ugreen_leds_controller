@@ -14,7 +14,7 @@ Package: $pkgname
 Version: $pkgver
 Architecture: amd64
 Maintainer: Yuhao Zhou <miskcoo@gmail.com>
-Depends: led-ugreen-dkms (>= 0.3), dmidecode, smartmontools, i2c-tools
+Depends: led-ugreen-dkms (>= 0.3), dmidecode, smartmontools, i2c-tools, python3 (>= 3.9), util-linux
 Recommends: led-ugreen-systemd
 Homepage: https://github.com/miskcoo/ugreen_leds_controller
 Description: UGREEN NAS LED monitoring utilities
@@ -51,11 +51,14 @@ chmod +x $pkgname/DEBIAN/postinst
 # Install monitoring scripts
 mkdir -p $pkgname/usr/bin/
 
-script_files=(ugreen-detect-disks ugreen-detect-network ugreen-diskiomon ugreen-netdevmon ugreen-netdevmon-multi ugreen-power-led ugreen-probe-leds)
+script_files=(ugreen-detect-disks ugreen-detect-network ugreen-diskiomon ugreen-diskiomon-notify ugreen-netdevmon ugreen-netdevmon-multi ugreen-power-led ugreen-probe-leds)
 for f in ${script_files[@]}; do
     cp scripts/$f $pkgname/usr/bin/
     chmod +x $pkgname/usr/bin/$f
 done
+
+mkdir -p $pkgname/usr/lib/udev/rules.d
+cp scripts/99-ugreen-diskiomon.rules $pkgname/usr/lib/udev/rules.d/
 
 # Install configuration files
 mkdir -p $pkgname/etc
